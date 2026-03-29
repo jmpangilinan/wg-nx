@@ -1,5 +1,8 @@
 # wg-nx
 
+Note:
+This is a personal project, and as such, I will most likely not provide any support at all for this outside of personal use cases
+
 Userland WireGuard library for Nintendo Switch.
 
 ![tester](readme/wg-nx.jpg)
