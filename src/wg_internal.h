@@ -17,12 +17,22 @@
 #define WG_COOKIE_LEN 16
 #define WG_MAC_LEN 16
 
-#define WG_REKEY_AFTER_MESSAGES ((uint64_t)1 << 60)
-#define WG_REJECT_AFTER_MESSAGES ((uint64_t)1 << 64 - (uint64_t)1 << 13 - 1)
-#define WG_REKEY_AFTER_TIME 120
-#define WG_REJECT_AFTER_TIME 180
-#define WG_REKEY_TIMEOUT 5
-#define WG_KEEPALIVE_TIMEOUT 10
+#define WG_REKEY_AFTER_MESSAGES  ((uint64_t)1 << 60)
+#define WG_COUNTER_WINDOW_SIZE   8192
+#define WG_REJECT_AFTER_MESSAGES (UINT64_MAX - WG_COUNTER_WINDOW_SIZE - 1)
+
+#define WG_COUNTER_WORDS (WG_COUNTER_WINDOW_SIZE / (sizeof(uint64_t) * 8))
+typedef struct {
+    uint64_t counter;
+    uint64_t backtrack[WG_COUNTER_WORDS];
+} WgReplayCounter;
+#define WG_REKEY_AFTER_TIME      120
+#define WG_REJECT_AFTER_TIME     180
+#define WG_REKEY_ATTEMPT_TIME    90
+#define WG_REKEY_TIMEOUT         5
+#define WG_MAX_TIMER_HANDSHAKES  18
+#define WG_KEEPALIVE_TIMEOUT     10
+#define WG_COOKIE_SECRET_MAX_AGE 120
 
 typedef enum {
     WG_MSG_HANDSHAKE_INIT = 1,
@@ -61,6 +71,15 @@ typedef struct __attribute__((packed)) {
     uint8_t encrypted_data[];
 } WgTransport;
 
+#define WG_COOKIE_NONCE_LEN 24
+typedef struct __attribute__((packed)) {
+    uint8_t type;
+    uint8_t reserved[3];
+    uint32_t receiver_index;
+    uint8_t nonce[WG_COOKIE_NONCE_LEN];
+    uint8_t encrypted_cookie[WG_COOKIE_LEN + WG_AEAD_TAG_LEN];
+} WgCookieReply;
+
 typedef struct {
     uint8_t hash[WG_HASH_LEN];
     uint8_t chaining_key[WG_HASH_LEN];
@@ -79,6 +98,7 @@ typedef struct {
     uint64_t last_received;
     bool valid;
     bool rekey_in_progress;
+    WgReplayCounter replay;
 } WgSession;
 
 struct WgTunnel {
@@ -92,10 +112,11 @@ struct WgTunnel {
     uint16_t keepalive_interval;
     int socket_fd;
     WgSession session;
+    WgSession prev_session;
     uint8_t cookie[WG_COOKIE_LEN];
     bool has_cookie;
     uint64_t cookie_timestamp;
-    uint8_t last_initiation_hash[WG_HASH_LEN];
+    uint8_t last_mac1[WG_MAC_LEN];
 
     WgThread recv_thread;
     WgThread keepalive_thread;
@@ -106,8 +127,14 @@ struct WgTunnel {
     void* recv_cb_user;
     bool running;
 
+    uint64_t last_sent;
+
     uint8_t pending_response[256];
     int pending_response_len;
+    bool pending_cookie;
+
+    struct sockaddr_in recv_src;
+    bool recv_src_valid;
 };
 
 void wg_hash(uint8_t out[WG_HASH_LEN], const void* data, size_t len);
@@ -121,18 +148,23 @@ void wg_mix_hash(WgHandshakeState* state, const void* data, size_t len);
 void wg_mix_key(WgHandshakeState* state, const void* input, size_t len);
 int wg_aead_encrypt(uint8_t* out, const uint8_t key[WG_KEY_LEN], uint64_t counter, const void* plaintext, size_t plaintext_len, const void* ad, size_t ad_len);
 int wg_aead_decrypt(uint8_t* out, const uint8_t key[WG_KEY_LEN], uint64_t counter, const void* ciphertext, size_t ciphertext_len, const void* ad, size_t ad_len);
+int wg_xaead_decrypt(uint8_t* out, const uint8_t key[WG_KEY_LEN], const uint8_t nonce[WG_COOKIE_NONCE_LEN], const void* ciphertext, size_t ciphertext_len, const void* ad, size_t ad_len);
 
 void wg_timestamp(uint8_t out[WG_TIMESTAMP_LEN]);
 uint64_t wg_time_now(void);
 void wg_sleep_ms(int ms);
 
+bool wg_counter_validate(WgReplayCounter* rc, uint64_t counter);
+
 int wg_handshake_init(WgTunnel* tun, WgHandshakeInit* msg, WgHandshakeState* state);
 int wg_handshake_response(WgTunnel* tun, const WgHandshakeResponse* msg, WgHandshakeState* state);
+int wg_process_cookie_reply(WgTunnel* tun, const WgCookieReply* msg);
 
 int wg_socket_open(WgTunnel* tun);
 int wg_socket_send(WgTunnel* tun, const void* data, size_t len);
 int wg_socket_recv(WgTunnel* tun, void* buf, size_t len, int timeout_ms);
 void wg_socket_close(WgTunnel* tun);
+void wg_update_endpoint_from_recv(WgTunnel* tun);
 
 uint32_t wg_random_index(void);
 int wg_resolve_endpoint(WgTunnel* tun, const char* host, uint16_t port);

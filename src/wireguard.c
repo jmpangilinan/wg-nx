@@ -6,12 +6,15 @@
 #include <arpa/inet.h>
 
 #define WG_MAX_PACKET_SIZE 2048
-#define WG_HANDSHAKE_TIMEOUT_MS 5000
 
 static uint8_t g_recv_packet[WG_MAX_PACKET_SIZE];
 
 #define WG_KEEPALIVE_DEFAULT 25
 #define WG_REKEY_CHECK_INTERVAL_MS 10000
+
+static int wg_jitter_ms(void) {
+    return (int)(wg_random_index() % 334);
+}
 
 static void (*wg_log_func)(const char* msg) = NULL;
 
@@ -84,6 +87,18 @@ void wg_set_recv_callback(WgTunnel* tun, WgRecvCallback cb, void* user) {
     tun->recv_cb_user = user;
 }
 
+static void wg_send_keepalive(WgTunnel* tun) {
+    uint8_t keepalive[sizeof(WgTransport) + WG_AEAD_TAG_LEN];
+    WgTransport* pkt = (WgTransport*)keepalive;
+    pkt->type = WG_MSG_TRANSPORT;
+    memset(pkt->reserved, 0, sizeof(pkt->reserved));
+    pkt->receiver_index = tun->session.remote_index;
+    pkt->counter = tun->session.sending_counter++;
+    wg_aead_encrypt(pkt->encrypted_data, tun->session.sending_key, pkt->counter, NULL, 0, NULL, 0);
+    wg_socket_send(tun, keepalive, sizeof(keepalive));
+    tun->last_sent = wg_time_now();
+}
+
 int wg_connect(WgTunnel* tun) {
     if (!tun)
         return WG_ERR_INVALID_CONFIG;
@@ -102,48 +117,79 @@ int wg_connect(WgTunnel* tun) {
     WgHandshakeState state;
     uint8_t recv_buf[256];
 
-    wg_log("creating handshake init");
-    int err = wg_handshake_init(tun, &init_msg, &state);
-    if (err != WG_OK) {
-        wg_log("handshake_init failed: %d", err);
-        return err;
-    }
-    wg_log("init created, idx=0x%08x sz=%zu", init_msg.sender_index, sizeof(init_msg));
+    int err = WG_ERR_TIMEOUT;
+    for (int attempt = 0; attempt < WG_MAX_TIMER_HANDSHAKES; attempt++) {
+        wg_log("connect: attempt %d", attempt + 1);
 
-    wg_log("sending to %08x:%d", tun->endpoint.sin_addr.s_addr, ntohs(tun->endpoint.sin_port));
-    int sent = wg_socket_send(tun, &init_msg, sizeof(init_msg));
-    wg_log("sent=%d", sent);
-    if (sent < 0)
-        return WG_ERR_SOCKET;
+        err = wg_handshake_init(tun, &init_msg, &state);
+        if (err != WG_OK) {
+            wg_log("handshake_init failed: %d", err);
+            break;
+        }
+        wg_log("connect: idx=0x%08x", init_msg.sender_index);
 
-    wg_log("waiting %dms", WG_HANDSHAKE_TIMEOUT_MS);
-    int received = wg_socket_recv(tun, recv_buf, sizeof(recv_buf), WG_HANDSHAKE_TIMEOUT_MS);
-    wg_log("received=%d", received);
-    if (received < 0)
-        return received;
+        int sent = wg_socket_send(tun, &init_msg, sizeof(init_msg));
+        if (sent < 0) {
+            err = WG_ERR_SOCKET;
+            break;
+        }
 
-    if ((size_t)received < sizeof(WgHandshakeResponse))
-        return WG_ERR_HANDSHAKE;
+        tun->pending_cookie = false;
 
-    WgHandshakeResponse* response = (WgHandshakeResponse*)recv_buf;
-    err = wg_handshake_response(tun, response, &state);
-    if (err != WG_OK)
-        return err;
+        int64_t remaining_ms = (int64_t)WG_REKEY_TIMEOUT * 1000 + wg_jitter_ms();
+        int received = WG_ERR_TIMEOUT;
+        while (remaining_ms > 0) {
+            received = wg_socket_recv(tun, recv_buf, sizeof(recv_buf), 10);
+            remaining_ms -= 10;
+            if (received >= 0)
+                break;
+            if (received != WG_ERR_TIMEOUT)
+                break;
+            if (tun->pending_cookie) {
+                wg_log("connect: cookie received, retransmitting");
+                break;
+            }
+        }
 
-    if (tun->keepalive_interval > 0) {
-        uint8_t keepalive[sizeof(WgTransport) + WG_AEAD_TAG_LEN];
-        WgTransport* pkt = (WgTransport*)keepalive;
-        pkt->type = WG_MSG_TRANSPORT;
-        memset(pkt->reserved, 0, sizeof(pkt->reserved));
-        pkt->receiver_index = tun->session.remote_index;
-        pkt->counter = tun->session.sending_counter++;
+        if (tun->pending_cookie) {
+            tun->pending_cookie = false;
+            err = WG_ERR_TIMEOUT;
+            continue;
+        }
 
-        wg_aead_encrypt(pkt->encrypted_data, tun->session.sending_key, pkt->counter, NULL, 0, NULL, 0);
-        wg_socket_send(tun, keepalive, sizeof(keepalive));
+        if (received < 0) {
+            wg_log("connect: no response (attempt %d)", attempt + 1);
+            err = WG_ERR_TIMEOUT;
+            crypto_wipe(&state, sizeof(state));
+            crypto_wipe(&init_msg, sizeof(init_msg));
+            continue;
+        }
+
+        if ((size_t)received < sizeof(WgHandshakeResponse)) {
+            err = WG_ERR_HANDSHAKE;
+            crypto_wipe(&state, sizeof(state));
+            continue;
+        }
+
+        WgHandshakeResponse* response = (WgHandshakeResponse*)recv_buf;
+        err = wg_handshake_response(tun, response, &state);
+        if (err == WG_OK)
+            break;
+
+        wg_log("connect: response failed (%d), retrying", err);
+        crypto_wipe(&state, sizeof(state));
+        crypto_wipe(&init_msg, sizeof(init_msg));
     }
 
     crypto_wipe(&state, sizeof(state));
     crypto_wipe(&init_msg, sizeof(init_msg));
+
+    if (err != WG_OK) {
+        tun->session.rekey_in_progress = false;
+        return err;
+    }
+
+    wg_send_keepalive(tun);
 
     return WG_OK;
 }
@@ -153,65 +199,95 @@ int wg_rekey(WgTunnel* tun) {
     WgHandshakeState state;
 
     uint32_t saved_local_index = tun->session.local_index;
-
     tun->pending_response_len = 0;
 
     wg_log("rekey: starting (old_idx=%08x)", tun->session.local_index);
 
-    int err = wg_handshake_init(tun, &init_msg, &state);
-    if (err != WG_OK) {
-        tun->session.rekey_in_progress = false;
-        return err;
-    }
+    int err = WG_ERR_TIMEOUT;
+    for (int attempt = 0; attempt < WG_MAX_TIMER_HANDSHAKES; attempt++) {
+        tun->pending_response_len = 0;
+        tun->pending_cookie = false;
 
-    wg_log("rekey: new_idx=%08x", tun->session.local_index);
-
-    wg_mutex_lock(&tun->send_mutex);
-    int sent = wg_socket_send(tun, &init_msg, sizeof(init_msg));
-    wg_mutex_unlock(&tun->send_mutex);
-
-    if (sent < 0) {
-        tun->session.local_index = saved_local_index;
-        tun->session.rekey_in_progress = false;
-        return WG_ERR_SOCKET;
-    }
-
-    uint64_t start = wg_time_now();
-    uint64_t timeout_ns = (uint64_t)WG_HANDSHAKE_TIMEOUT_MS * 1000000ULL;
-
-    while (wg_time_now() - start < timeout_ns) {
-        if (tun->pending_response_len > 0)
+        err = wg_handshake_init(tun, &init_msg, &state);
+        if (err != WG_OK) {
+            wg_log("rekey: init failed: %d", err);
             break;
-        wg_sleep_ms(10);
+        }
+        wg_log("rekey: attempt %d new_idx=%08x", attempt + 1, tun->session.local_index);
+
+        wg_mutex_lock(&tun->send_mutex);
+        int sent = wg_socket_send(tun, &init_msg, sizeof(init_msg));
+        wg_mutex_unlock(&tun->send_mutex);
+
+        if (sent < 0) {
+            err = WG_ERR_SOCKET;
+            break;
+        }
+
+        int64_t remaining_ms = (int64_t)WG_REKEY_TIMEOUT * 1000 + wg_jitter_ms();
+        while (remaining_ms > 0) {
+            if (tun->pending_response_len > 0 || tun->pending_cookie)
+                break;
+            wg_sleep_ms(10);
+            remaining_ms -= 10;
+        }
+
+        if (tun->pending_cookie) {
+            wg_log("rekey: cookie received, retransmitting with mac2");
+            tun->pending_cookie = false;
+            crypto_wipe(&state, sizeof(state));
+            crypto_wipe(&init_msg, sizeof(init_msg));
+            continue;
+        }
+
+        if (tun->pending_response_len == 0) {
+            wg_log("rekey: timeout attempt %d", attempt + 1);
+            err = WG_ERR_TIMEOUT;
+            crypto_wipe(&state, sizeof(state));
+            crypto_wipe(&init_msg, sizeof(init_msg));
+            continue;
+        }
+
+        if ((size_t)tun->pending_response_len < sizeof(WgHandshakeResponse)) {
+            err = WG_ERR_HANDSHAKE;
+            crypto_wipe(&state, sizeof(state));
+            crypto_wipe(&init_msg, sizeof(init_msg));
+            continue;
+        }
+
+        WgHandshakeResponse* response = (WgHandshakeResponse*)tun->pending_response;
+        err = wg_handshake_response(tun, response, &state);
+        if (err == WG_OK) {
+            wg_log("rekey: success");
+            break;
+        }
+        wg_log("rekey: response failed (%d) attempt %d", err, attempt + 1);
+        crypto_wipe(&state, sizeof(state));
+        crypto_wipe(&init_msg, sizeof(init_msg));
     }
 
-    if (tun->pending_response_len == 0) {
-        wg_log("rekey: timeout, restoring old_idx=%08x", saved_local_index);
-        tun->session.local_index = saved_local_index;
-        tun->session.rekey_in_progress = false;
-        return WG_ERR_TIMEOUT;
-    }
-
-    if ((size_t)tun->pending_response_len < sizeof(WgHandshakeResponse)) {
-        tun->session.local_index = saved_local_index;
-        tun->session.rekey_in_progress = false;
-        return WG_ERR_HANDSHAKE;
-    }
-
-    WgHandshakeResponse* response = (WgHandshakeResponse*)tun->pending_response;
-    err = wg_handshake_response(tun, response, &state);
-    if (err != WG_OK) {
-        wg_log("rekey: response failed, restoring old_idx=%08x", saved_local_index);
-        tun->session.local_index = saved_local_index;
-        tun->session.rekey_in_progress = false;
-        return err;
-    }
-
-    wg_log("rekey: success");
     crypto_wipe(&state, sizeof(state));
     crypto_wipe(&init_msg, sizeof(init_msg));
 
+    if (err != WG_OK) {
+        tun->session.local_index = saved_local_index;
+        tun->session.rekey_in_progress = false;
+        return err;
+    }
+
+    wg_mutex_lock(&tun->send_mutex);
+    wg_send_keepalive(tun);
+    wg_mutex_unlock(&tun->send_mutex);
+
     return WG_OK;
+}
+
+static bool wg_session_expired(WgTunnel* tun) {
+    if (!tun->session.valid)
+        return false;
+    uint64_t elapsed = wg_time_now() - tun->session.last_handshake;
+    return elapsed >= (uint64_t)WG_REJECT_AFTER_TIME * 1000000000ULL ||
+           tun->session.sending_counter >= WG_REJECT_AFTER_MESSAGES;
 }
 
 static bool wg_needs_rekey(WgTunnel* tun) {
@@ -276,15 +352,47 @@ static void* recv_thread_func(void* arg) {
                     tun->pending_response_len = received;
                     wg_log("recv: stored handshake response for rekey");
                 }
+            } else if (transport->type == WG_MSG_COOKIE_REPLY) {
+                if ((size_t)received >= sizeof(WgCookieReply)) {
+                    wg_process_cookie_reply(tun, (const WgCookieReply*)packet);
+                    tun->pending_cookie = true;
+                }
+            } else if (transport->type == WG_MSG_HANDSHAKE_INIT) {
+                if (!tun->session.rekey_in_progress) {
+                    wg_log("recv: server-initiated handshake, triggering rekey");
+                    tun->session.rekey_in_progress = true; /* keepalive thread will pick it up */
+                }
             } else {
                 wg_log("recv: not transport (type=%d)", transport->type);
             }
             continue;
         }
 
-        if (transport->receiver_index != tun->session.local_index &&
-            !(tun->session.rekey_in_progress && transport->receiver_index == tun->session.old_local_index)) {
-            wg_log("recv: idx mismatch (got=%08x want=%08x)", transport->receiver_index, tun->session.local_index);
+        uint32_t cur_idx = __atomic_load_n(&tun->session.local_index, __ATOMIC_ACQUIRE);
+        __atomic_load_n(&tun->session.rekey_in_progress, __ATOMIC_ACQUIRE);
+        WgSession* sess = NULL;
+        if (transport->receiver_index == cur_idx) {
+            sess = &tun->session;
+        } else if (transport->receiver_index == tun->session.old_local_index) {
+            sess = &tun->session;
+        } else if (tun->prev_session.valid &&
+                   transport->receiver_index == tun->prev_session.local_index) {
+            sess = &tun->prev_session;
+        } else {
+            wg_log("recv: idx mismatch (got=%08x want=%08x prev_valid=%d prev_idx=%08x old_idx=%08x)",
+                   transport->receiver_index, cur_idx,
+                   tun->prev_session.valid, tun->prev_session.local_index,
+                   tun->session.old_local_index);
+            continue;
+        }
+
+        uint64_t sess_elapsed = wg_time_now() - sess->last_handshake;
+        if (sess_elapsed >= (uint64_t)WG_REJECT_AFTER_TIME * 1000000000ULL) {
+            wg_log("recv: session expired, dropping transport");
+            if (sess == &tun->prev_session) {
+                crypto_wipe(&tun->prev_session, sizeof(tun->prev_session));
+                tun->prev_session.valid = false;
+            }
             continue;
         }
 
@@ -292,18 +400,27 @@ static void* recv_thread_func(void* arg) {
         size_t plaintext_len = ciphertext_len - WG_AEAD_TAG_LEN;
 
         if (plaintext_len == 0) {
-            tun->session.last_received = wg_time_now();
+            sess->last_received = wg_time_now();
             continue;
         }
 
-        int err = wg_aead_decrypt(transport->encrypted_data, tun->session.receiving_key, transport->counter, transport->encrypted_data, ciphertext_len, NULL, 0);
+        int err = wg_aead_decrypt(transport->encrypted_data, sess->receiving_key, transport->counter, transport->encrypted_data, ciphertext_len, NULL, 0);
         if (err != 0) {
             wg_log("recv: decrypt failed (ctr=%llu)", (unsigned long long)transport->counter);
             continue;
         }
 
-        tun->session.last_received = wg_time_now();
-        tun->session.receiving_counter = transport->counter + 1;
+        if (!wg_counter_validate(&sess->replay, transport->counter)) {
+            wg_log("recv: replay detected (ctr=%llu)", (unsigned long long)transport->counter);
+            continue;
+        }
+
+        sess->last_received = wg_time_now();
+        sess->receiving_counter = transport->counter + 1;
+
+        wg_mutex_lock(&tun->send_mutex);
+        wg_update_endpoint_from_recv(tun);
+        wg_mutex_unlock(&tun->send_mutex);
 
         if (tun->recv_cb)
             tun->recv_cb(tun->recv_cb_user, transport->encrypted_data, plaintext_len);
@@ -317,10 +434,14 @@ static void* keepalive_thread_func(void* arg) {
     WgTunnel* tun = (WgTunnel*)arg;
     wg_thread_set_affinity(WG_THREAD_NAME_SEND);
     uint64_t keepalive_interval_ms = tun->keepalive_interval * 1000;
-    uint64_t check_interval_ms = keepalive_interval_ms < WG_REKEY_CHECK_INTERVAL_MS
+    uint64_t check_interval_ms = keepalive_interval_ms > 0 && keepalive_interval_ms < WG_REKEY_CHECK_INTERVAL_MS
         ? keepalive_interval_ms
         : WG_REKEY_CHECK_INTERVAL_MS;
     uint64_t last_keepalive = wg_time_now();
+
+#define WG_KEEPALIVE_TIMEOUT_NS  ((uint64_t)WG_KEEPALIVE_TIMEOUT  * 1000000000ULL)
+#define WG_DEAD_PEER_TIMEOUT_NS  ((uint64_t)(WG_KEEPALIVE_TIMEOUT + WG_REKEY_TIMEOUT) * 1000000000ULL)
+#define WG_ZERO_KEY_TIMEOUT_NS   ((uint64_t)(WG_REJECT_AFTER_TIME * 3) * 1000000000ULL)
 
     while (!wg_stop_cond_check(&tun->stop_cond)) {
         int result = wg_stop_cond_timedwait(&tun->stop_cond, check_interval_ms);
@@ -328,29 +449,49 @@ static void* keepalive_thread_func(void* arg) {
         if (result == 0)
             break;
 
+        uint64_t now = wg_time_now();
+
+        if (tun->session.valid &&
+            (now - tun->session.last_handshake) >= WG_ZERO_KEY_TIMEOUT_NS) {
+            wg_log("keepalive: session keys exceeded REJECT_AFTER_TIME×3, zeroing");
+            crypto_wipe(&tun->session, sizeof(tun->session));
+            tun->session.valid = false;
+            crypto_wipe(&tun->prev_session, sizeof(tun->prev_session));
+            tun->prev_session.valid = false;
+            continue;
+        }
+
         if (!tun->session.valid)
             continue;
 
-        if (wg_needs_rekey(tun)) {
+        if (tun->session.last_received > 0 &&
+            (now - tun->session.last_received) >= WG_DEAD_PEER_TIMEOUT_NS &&
+            !tun->session.rekey_in_progress) {
+            wg_log("keepalive: dead peer detected, rekeying");
             wg_rekey(tun);
             last_keepalive = wg_time_now();
             continue;
         }
 
-        uint64_t now = wg_time_now();
+        bool server_triggered = tun->session.rekey_in_progress && !wg_needs_rekey(tun);
+        if (wg_needs_rekey(tun) || server_triggered) {
+            wg_rekey(tun);
+            last_keepalive = wg_time_now();
+            continue;
+        }
+
+        if (tun->session.last_received > 0 &&
+            (now - tun->last_sent) >= WG_KEEPALIVE_TIMEOUT_NS) {
+            wg_mutex_lock(&tun->send_mutex);
+            wg_send_keepalive(tun);
+            wg_mutex_unlock(&tun->send_mutex);
+            last_keepalive = now;
+            continue;
+        }
+
         if (tun->keepalive_interval > 0 && (now - last_keepalive) >= (uint64_t)tun->keepalive_interval * 1000000000ULL) {
             wg_mutex_lock(&tun->send_mutex);
-
-            uint8_t keepalive[sizeof(WgTransport) + WG_AEAD_TAG_LEN];
-            WgTransport* pkt = (WgTransport*)keepalive;
-            pkt->type = WG_MSG_TRANSPORT;
-            memset(pkt->reserved, 0, sizeof(pkt->reserved));
-            pkt->receiver_index = tun->session.remote_index;
-            pkt->counter = tun->session.sending_counter++;
-
-            wg_aead_encrypt(pkt->encrypted_data, tun->session.sending_key, pkt->counter, NULL, 0, NULL, 0);
-            wg_socket_send(tun, keepalive, sizeof(keepalive));
-
+            wg_send_keepalive(tun);
             wg_mutex_unlock(&tun->send_mutex);
             last_keepalive = now;
         }
@@ -400,6 +541,9 @@ int wg_send(WgTunnel* tun, const void* data, size_t len) {
     if (!tun || !tun->session.valid)
         return WG_ERR_NOT_CONNECTED;
 
+    if (wg_session_expired(tun))
+        return WG_ERR_NOT_CONNECTED;
+
     size_t packet_size = sizeof(WgTransport) + len + WG_AEAD_TAG_LEN;
     if (packet_size > WG_MAX_PACKET_SIZE)
         return WG_ERR_BUFFER_TOO_SMALL;
@@ -416,6 +560,8 @@ int wg_send(WgTunnel* tun, const void* data, size_t len) {
     wg_aead_encrypt(transport->encrypted_data, tun->session.sending_key, transport->counter, data, len, NULL, 0);
 
     int sent = wg_socket_send(tun, packet, packet_size);
+    if (sent >= 0)
+        tun->last_sent = wg_time_now();
 
     wg_mutex_unlock(&tun->send_mutex);
 
@@ -461,6 +607,9 @@ int wg_recv(WgTunnel* tun, void* buf, size_t len, int timeout_ms) {
     if (err != 0)
         return WG_ERR_DECRYPT;
 
+    if (!wg_counter_validate(&tun->session.replay, transport->counter))
+        return WG_ERR_DECRYPT;
+
     tun->session.last_received = wg_time_now();
     tun->session.receiving_counter = transport->counter + 1;
 
@@ -485,6 +634,7 @@ void wg_close(WgTunnel* tun) {
     crypto_wipe(tun->static_private, WG_KEY_LEN);
     crypto_wipe(tun->preshared_key, WG_KEY_LEN);
     crypto_wipe(&tun->session, sizeof(tun->session));
+    crypto_wipe(&tun->prev_session, sizeof(tun->prev_session));
     free(tun);
 }
 

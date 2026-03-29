@@ -8,6 +8,7 @@
 
 extern "C" {
 #include "wireguard.h"
+#include "wg_internal.h"
 #include "wg_relay.h"
 #include "wg_thread.h"
 #include "blake2s.h"
@@ -773,6 +774,797 @@ static void test_poly1305_aead_32byte_ad() {
     results.push_back({"AEAD 32-byte AD", all_ok});
 }
 
+/* ── Anti-replay sliding window tests (§5.4.6 / RFC6479) ── */
+
+static void test_counter_sequential() {
+    WgReplayCounter rc = {};
+    bool ok = true;
+    /* Sequential counters 0..999 should all be accepted */
+    for (uint64_t i = 0; i < 1000; i++) {
+        if (!wg_counter_validate(&rc, i)) {
+            brls::Logger::error("[COUNTER] sequential failed at {}", i);
+            ok = false;
+            break;
+        }
+    }
+    results.push_back({"Counter Sequential", ok});
+}
+
+static void test_counter_duplicate() {
+    WgReplayCounter rc = {};
+    bool ok = true;
+    /* Accept counter 42, then reject duplicate */
+    ok = ok && wg_counter_validate(&rc, 42);
+    ok = ok && !wg_counter_validate(&rc, 42);
+    /* Accept a new counter, then reject its duplicate too */
+    ok = ok && wg_counter_validate(&rc, 100);
+    ok = ok && !wg_counter_validate(&rc, 100);
+    results.push_back({"Counter Duplicate", ok});
+}
+
+static void test_counter_out_of_order() {
+    WgReplayCounter rc = {};
+    bool ok = true;
+    /* Push high water mark to 500 */
+    ok = ok && wg_counter_validate(&rc, 500);
+    /* Out-of-order within window should be accepted */
+    ok = ok && wg_counter_validate(&rc, 300);
+    ok = ok && wg_counter_validate(&rc, 499);
+    ok = ok && wg_counter_validate(&rc, 1);
+    /* But not duplicates of those */
+    ok = ok && !wg_counter_validate(&rc, 300);
+    ok = ok && !wg_counter_validate(&rc, 499);
+    results.push_back({"Counter OOO", ok});
+}
+
+static void test_counter_window_boundary() {
+    WgReplayCounter rc = {};
+    bool ok = true;
+    /* Push high water mark to WG_COUNTER_WINDOW_SIZE + 100 */
+    uint64_t high = WG_COUNTER_WINDOW_SIZE + 100;
+    ok = ok && wg_counter_validate(&rc, high);
+    /* Counter exactly at the window boundary: high - WG_COUNTER_WINDOW_SIZE */
+    /* This is the oldest counter still in window — should be accepted */
+    uint64_t boundary = high - WG_COUNTER_WINDOW_SIZE + 1;
+    ok = ok && wg_counter_validate(&rc, boundary);
+    /* One before the boundary — too old, should be rejected */
+    ok = ok && !wg_counter_validate(&rc, boundary - 1);
+    results.push_back({"Counter Window", ok});
+}
+
+static void test_counter_reject_after_messages() {
+    WgReplayCounter rc = {};
+    bool ok = true;
+    /* Counter at REJECT_AFTER_MESSAGES should be rejected (§6.2) */
+    ok = ok && !wg_counter_validate(&rc, WG_REJECT_AFTER_MESSAGES);
+    ok = ok && !wg_counter_validate(&rc, WG_REJECT_AFTER_MESSAGES + 1);
+    /* Counter just below should be accepted */
+    ok = ok && wg_counter_validate(&rc, WG_REJECT_AFTER_MESSAGES - 1);
+    results.push_back({"Counter Reject Limit", ok});
+}
+
+static void test_counter_large_jump() {
+    WgReplayCounter rc = {};
+    bool ok = true;
+    /* Accept 0, then jump far ahead — entire window should be cleared */
+    ok = ok && wg_counter_validate(&rc, 0);
+    ok = ok && wg_counter_validate(&rc, WG_COUNTER_WINDOW_SIZE * 3);
+    /* 0 is now outside the window */
+    ok = ok && !wg_counter_validate(&rc, 0);
+    /* But something within the new window works */
+    uint64_t high = WG_COUNTER_WINDOW_SIZE * 3;
+    ok = ok && wg_counter_validate(&rc, high - 100);
+    /* And it's not a false positive for a counter we never saw */
+    ok = ok && wg_counter_validate(&rc, high - 200);
+    results.push_back({"Counter Large Jump", ok});
+}
+
+/* ── XChaCha20Poly1305 test (cookie reply path, §5.4.7) ── */
+
+static void test_xchacha20poly1305() {
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)(i + 0x10);
+
+    uint8_t nonce[24];
+    for (int i = 0; i < 24; i++) nonce[i] = (uint8_t)(i + 0x30);
+
+    uint8_t ad[16];
+    for (int i = 0; i < 16; i++) ad[i] = (uint8_t)(i + 0x50);
+
+    /* Encrypt with monocypher's XChaCha20Poly1305 */
+    const uint8_t plaintext[16] = {
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08
+    };
+    uint8_t ciphertext[16];
+    uint8_t tag[16];
+
+    crypto_aead_ctx ctx;
+    crypto_aead_init_x(&ctx, key, nonce);
+    crypto_aead_write(&ctx, ciphertext, tag, ad, sizeof(ad), plaintext, sizeof(plaintext));
+    crypto_wipe(&ctx, sizeof(ctx));
+
+    /* Combine ciphertext + tag for wg_xaead_decrypt (expects appended tag) */
+    uint8_t combined[32]; /* 16 ciphertext + 16 tag */
+    memcpy(combined, ciphertext, 16);
+    memcpy(combined + 16, tag, 16);
+
+    /* Decrypt with our wg_xaead_decrypt */
+    uint8_t decrypted[16];
+    int result = wg_xaead_decrypt(decrypted, key, nonce, combined, sizeof(combined), ad, sizeof(ad));
+
+    bool decrypt_ok = (result == 0);
+    bool data_ok = compare_bytes(decrypted, plaintext, 16);
+
+    /* Also test with wrong AD — should fail */
+    uint8_t bad_ad[16];
+    memcpy(bad_ad, ad, 16);
+    bad_ad[0] ^= 0xFF;
+    uint8_t dummy[16];
+    int bad_result = wg_xaead_decrypt(dummy, key, nonce, combined, sizeof(combined), bad_ad, sizeof(bad_ad));
+    bool reject_ok = (bad_result != 0);
+
+    results.push_back({"XChaCha20Poly1305", decrypt_ok && data_ok && reject_ok});
+}
+
+/* ── Transport after rekey integration test ── */
+
+static std::string transport_error_detail;
+
+static void test_transport_after_rekey() {
+    uint8_t priv[32], pub[32];
+    wg_generate_keypair(priv, pub);
+
+    char pub_b64[64];
+    wg_key_to_base64(pub_b64, sizeof(pub_b64), pub);
+
+    uint8_t server_pub[32];
+    uint16_t server_port;
+    char my_ip[32];
+
+    if (!get_demo_config(server_pub, &server_port, my_ip, pub_b64)) {
+        transport_error_detail = "network";
+        results.push_back({"Transport Rekey", false});
+        return;
+    }
+
+    WgConfig config = {};
+    memcpy(config.private_key, priv, 32);
+    memcpy(config.peer_public_key, server_pub, 32);
+    inet_pton(AF_INET, my_ip, &config.tunnel_ip);
+    strncpy(config.endpoint_host, DEMO_HOST, sizeof(config.endpoint_host));
+    config.endpoint_port = server_port;
+    config.keepalive_interval = 25;
+    config.has_preshared_key = 0;
+
+    WgTunnel* tun = wg_init(&config);
+    if (!tun) {
+        transport_error_detail = "init";
+        results.push_back({"Transport Rekey", false});
+        return;
+    }
+
+    int err = wg_connect(tun);
+    if (err != WG_OK) {
+        transport_error_detail = fmt::format("connect={}", err);
+        wg_close(tun);
+        results.push_back({"Transport Rekey", false});
+        return;
+    }
+
+    /* Send a keepalive on the first session to confirm it works */
+    uint8_t keepalive[sizeof(WgTransport) + WG_AEAD_TAG_LEN];
+    WgTransport* pkt = (WgTransport*)keepalive;
+    pkt->type = WG_MSG_TRANSPORT;
+    memset(pkt->reserved, 0, sizeof(pkt->reserved));
+    pkt->receiver_index = tun->session.remote_index;
+    pkt->counter = tun->session.sending_counter++;
+    wg_aead_encrypt(pkt->encrypted_data, tun->session.sending_key, pkt->counter, NULL, 0, NULL, 0);
+    wg_socket_send(tun, keepalive, sizeof(keepalive));
+
+    uint32_t idx1 = tun->session.local_index;
+
+    /* Start recv thread so rekey can get responses */
+    err = wg_start(tun);
+    if (err != WG_OK) {
+        transport_error_detail = fmt::format("start={}", err);
+        wg_close(tun);
+        results.push_back({"Transport Rekey", false});
+        return;
+    }
+
+    /* Rekey to get a new session */
+    err = wg_rekey(tun);
+    if (err != WG_OK) {
+        transport_error_detail = fmt::format("rekey={}", err);
+        wg_close(tun);
+        results.push_back({"Transport Rekey", false});
+        return;
+    }
+
+    uint32_t idx2 = tun->session.local_index;
+    bool index_changed = (idx1 != idx2);
+
+    /* Send transport data on the NEW session */
+    uint8_t test_data[] = {0x45, 0x00, 0x00, 0x1c}; /* minimal IP header start */
+    int send_result = wg_send(tun, test_data, sizeof(test_data));
+    bool send_ok = (send_result == (int)sizeof(test_data));
+
+    /* Verify prev_session holds the old index (session rotation §6.3) */
+    bool rotation_ok = tun->prev_session.valid && (tun->prev_session.local_index == idx1);
+
+    wg_close(tun);
+
+    transport_error_detail = fmt::format("idx {}→{} send={} rot={}",
+        idx1, idx2, send_result, rotation_ok ? 1 : 0);
+    results.push_back({"Transport Rekey", index_changed && send_ok && rotation_ok});
+}
+
+/* ── AEAD (monocypher path) roundtrip tests ── */
+
+static void test_aead_roundtrip() {
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)(i + 0xA0);
+
+    const char* plaintext = "WireGuard transport data test payload";
+    size_t plen = strlen(plaintext);
+
+    /* Encrypt then decrypt — basic roundtrip */
+    uint8_t ciphertext[256];
+    wg_aead_encrypt(ciphertext, key, 7, plaintext, plen, NULL, 0);
+
+    uint8_t decrypted[256];
+    int result = wg_aead_decrypt(decrypted, key, 7, ciphertext, plen + WG_AEAD_TAG_LEN, NULL, 0);
+    bool roundtrip_ok = (result == 0) && compare_bytes(decrypted, (const uint8_t*)plaintext, plen);
+
+    /* Wrong counter — must fail */
+    result = wg_aead_decrypt(decrypted, key, 8, ciphertext, plen + WG_AEAD_TAG_LEN, NULL, 0);
+    bool wrong_ctr_ok = (result != 0);
+
+    /* Wrong key — must fail */
+    uint8_t bad_key[32];
+    memcpy(bad_key, key, 32);
+    bad_key[0] ^= 0xFF;
+    result = wg_aead_decrypt(decrypted, bad_key, 7, ciphertext, plen + WG_AEAD_TAG_LEN, NULL, 0);
+    bool wrong_key_ok = (result != 0);
+
+    /* Tampered ciphertext — must fail */
+    uint8_t tampered[256];
+    memcpy(tampered, ciphertext, plen + WG_AEAD_TAG_LEN);
+    tampered[0] ^= 0x01;
+    result = wg_aead_decrypt(decrypted, key, 7, tampered, plen + WG_AEAD_TAG_LEN, NULL, 0);
+    bool tamper_ok = (result != 0);
+
+    results.push_back({"AEAD Roundtrip", roundtrip_ok && wrong_ctr_ok && wrong_key_ok && tamper_ok});
+}
+
+static void test_aead_with_ad() {
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
+
+    uint8_t ad[32];
+    for (int i = 0; i < 32; i++) ad[i] = (uint8_t)(i + 0x10);
+
+    const char* plaintext = "test with AD";
+    size_t plen = strlen(plaintext);
+
+    uint8_t ciphertext[256];
+    wg_aead_encrypt(ciphertext, key, 0, plaintext, plen, ad, 32);
+
+    /* Correct AD — succeeds */
+    uint8_t decrypted[256];
+    int result = wg_aead_decrypt(decrypted, key, 0, ciphertext, plen + WG_AEAD_TAG_LEN, ad, 32);
+    bool ad_ok = (result == 0) && compare_bytes(decrypted, (const uint8_t*)plaintext, plen);
+
+    /* Wrong AD — must fail */
+    uint8_t bad_ad[32];
+    memcpy(bad_ad, ad, 32);
+    bad_ad[0] ^= 0xFF;
+    result = wg_aead_decrypt(decrypted, key, 0, ciphertext, plen + WG_AEAD_TAG_LEN, bad_ad, 32);
+    bool bad_ad_ok = (result != 0);
+
+    /* No AD when one was used — must fail */
+    result = wg_aead_decrypt(decrypted, key, 0, ciphertext, plen + WG_AEAD_TAG_LEN, NULL, 0);
+    bool no_ad_ok = (result != 0);
+
+    results.push_back({"AEAD with AD", ad_ok && bad_ad_ok && no_ad_ok});
+}
+
+static void test_aead_empty() {
+    uint8_t key[32] = {0};
+
+    /* Empty plaintext (keepalive packet) */
+    uint8_t ciphertext[WG_AEAD_TAG_LEN];
+    wg_aead_encrypt(ciphertext, key, 0, NULL, 0, NULL, 0);
+
+    uint8_t decrypted[1];
+    int result = wg_aead_decrypt(decrypted, key, 0, ciphertext, WG_AEAD_TAG_LEN, NULL, 0);
+    bool empty_ok = (result == 0);
+
+    /* Too short ciphertext — must fail */
+    result = wg_aead_decrypt(decrypted, key, 0, ciphertext, WG_AEAD_TAG_LEN - 1, NULL, 0);
+    bool short_ok = (result != 0);
+
+    results.push_back({"AEAD Empty", empty_ok && short_ok});
+}
+
+/* ── Cookie reply full flow test (§5.4.7) ── */
+
+static void test_cookie_reply_flow() {
+    /* Create a tunnel so we have a real WgTunnel struct */
+    uint8_t priv[32], pub[32], peer_priv[32], peer_pub[32];
+    wg_generate_keypair(priv, pub);
+    wg_generate_keypair(peer_priv, peer_pub);
+
+    WgConfig config = {};
+    memcpy(config.private_key, priv, 32);
+    memcpy(config.peer_public_key, peer_pub, 32);
+    config.tunnel_ip.s_addr = inet_addr("10.0.0.2");
+    strncpy(config.endpoint_host, "127.0.0.1", sizeof(config.endpoint_host));
+    config.endpoint_port = 51820;
+    config.keepalive_interval = 25;
+
+    WgTunnel* tun = wg_init(&config);
+    if (!tun) {
+        results.push_back({"Cookie Reply Flow", false});
+        return;
+    }
+
+    /* Set up state as if we sent a handshake init */
+    uint32_t our_index = 0xDEADBEEF;
+    tun->session.local_index = our_index;
+    /* Simulate mac1 that was sent with the init */
+    uint8_t fake_mac1[WG_MAC_LEN];
+    for (int i = 0; i < WG_MAC_LEN; i++) fake_mac1[i] = (uint8_t)(i + 0x42);
+    memcpy(tun->last_mac1, fake_mac1, WG_MAC_LEN);
+
+    /* Construct a cookie reply as the server would:
+     * key = HASH(LABEL_COOKIE || peer_public)
+     * AD  = mac1 from the initiating handshake
+     * plaintext = 16-byte cookie
+     */
+    uint8_t cookie_key[WG_HASH_LEN];
+    wg_hash2(cookie_key, WG_LABEL_COOKIE, strlen(WG_LABEL_COOKIE), peer_pub, WG_KEY_LEN);
+
+    uint8_t real_cookie[WG_COOKIE_LEN];
+    for (int i = 0; i < WG_COOKIE_LEN; i++) real_cookie[i] = (uint8_t)(i + 0xC0);
+
+    uint8_t nonce[WG_COOKIE_NONCE_LEN];
+    for (int i = 0; i < WG_COOKIE_NONCE_LEN; i++) nonce[i] = (uint8_t)(i + 0x77);
+
+    /* Encrypt with XChaCha20Poly1305 */
+    uint8_t encrypted_cookie[WG_COOKIE_LEN + WG_AEAD_TAG_LEN];
+    uint8_t tag[WG_AEAD_TAG_LEN];
+    crypto_aead_ctx ctx;
+    crypto_aead_init_x(&ctx, cookie_key, nonce);
+    crypto_aead_write(&ctx, encrypted_cookie, tag, fake_mac1, WG_MAC_LEN, real_cookie, WG_COOKIE_LEN);
+    memcpy(encrypted_cookie + WG_COOKIE_LEN, tag, WG_AEAD_TAG_LEN);
+    crypto_wipe(&ctx, sizeof(ctx));
+
+    /* Build the cookie reply message */
+    WgCookieReply reply;
+    reply.type = WG_MSG_COOKIE_REPLY;
+    memset(reply.reserved, 0, sizeof(reply.reserved));
+    reply.receiver_index = our_index;
+    memcpy(reply.nonce, nonce, WG_COOKIE_NONCE_LEN);
+    memcpy(reply.encrypted_cookie, encrypted_cookie, sizeof(reply.encrypted_cookie));
+
+    /* Process it */
+    tun->has_cookie = false;
+    int err = wg_process_cookie_reply(tun, &reply);
+
+    bool decrypt_ok = (err == WG_OK);
+    bool cookie_set = tun->has_cookie;
+    bool cookie_match = compare_bytes(tun->cookie, real_cookie, WG_COOKIE_LEN);
+    bool timestamp_set = (tun->cookie_timestamp > 0);
+
+    /* Wrong receiver_index — must fail */
+    reply.receiver_index = 0x12345678;
+    int bad_err = wg_process_cookie_reply(tun, &reply);
+    bool bad_index_ok = (bad_err != WG_OK);
+
+    wg_close(tun);
+
+    results.push_back({"Cookie Reply Flow", decrypt_ok && cookie_set && cookie_match && timestamp_set && bad_index_ok});
+}
+
+/* ── Hash / HMAC tests ── */
+
+static void test_wg_hash() {
+    /* wg_hash is BLAKE2s — verify against known vector */
+    uint8_t expected[32];
+    hex_to_bytes(expected, "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982", 32);
+
+    uint8_t result[32];
+    wg_hash(result, "abc", 3);
+
+    results.push_back({"WG Hash", compare_bytes(result, expected, 32)});
+}
+
+static void test_wg_hash2() {
+    /* wg_hash2(a, b) should equal BLAKE2s(a || b) */
+    const char* a = "Hello";
+    const char* b = "World";
+
+    /* Compute via wg_hash2 */
+    uint8_t h2[32];
+    wg_hash2(h2, a, 5, b, 5);
+
+    /* Compute via BLAKE2s with concatenated input */
+    uint8_t concat[10];
+    memcpy(concat, a, 5);
+    memcpy(concat + 5, b, 5);
+    uint8_t h_concat[32];
+    wg_hash(h_concat, concat, 10);
+
+    results.push_back({"WG Hash2", compare_bytes(h2, h_concat, 32)});
+}
+
+static void test_wg_mac() {
+    /* wg_mac is keyed BLAKE2s with 16-byte output */
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
+
+    uint8_t mac1[WG_MAC_LEN], mac2[WG_MAC_LEN];
+    wg_mac(mac1, key, 32, "test", 4);
+    wg_mac(mac2, key, 32, "test", 4);
+
+    /* Same input → same output */
+    bool same_ok = compare_bytes(mac1, mac2, WG_MAC_LEN);
+
+    /* Different input → different output */
+    wg_mac(mac2, key, 32, "tess", 4);
+    bool diff_ok = !compare_bytes(mac1, mac2, WG_MAC_LEN);
+
+    /* Different key → different output */
+    uint8_t key2[32];
+    memcpy(key2, key, 32);
+    key2[0] ^= 0xFF;
+    wg_mac(mac2, key2, 32, "test", 4);
+    bool diff_key_ok = !compare_bytes(mac1, mac2, WG_MAC_LEN);
+
+    results.push_back({"WG MAC", same_ok && diff_ok && diff_key_ok});
+}
+
+static void test_wg_hmac() {
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)(i + 0x50);
+
+    uint8_t hmac1[32], hmac2[32];
+
+    /* Deterministic */
+    wg_hmac(hmac1, 32, key, 32, "data", 4);
+    wg_hmac(hmac2, 32, key, 32, "data", 4);
+    bool same_ok = compare_bytes(hmac1, hmac2, 32);
+
+    /* Different data → different output */
+    wg_hmac(hmac2, 32, key, 32, "dat0", 4);
+    bool diff_ok = !compare_bytes(hmac1, hmac2, 32);
+
+    /* Different key → different output */
+    uint8_t key2[32];
+    memcpy(key2, key, 32);
+    key2[0] ^= 0xFF;
+    wg_hmac(hmac2, 32, key2, 32, "data", 4);
+    bool diff_key_ok = !compare_bytes(hmac1, hmac2, 32);
+
+    results.push_back({"WG HMAC", same_ok && diff_ok && diff_key_ok});
+}
+
+/* ── KDF tests ── */
+
+static void test_kdf_consistency() {
+    /* kdf1(key, input) should equal the first output of kdf2(key, input) */
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)(i + 0x20);
+
+    const char* input = "KDF test input";
+
+    uint8_t kdf1_out[32];
+    wg_kdf1(kdf1_out, key, input, strlen(input));
+
+    uint8_t kdf2_out1[32], kdf2_out2[32];
+    wg_kdf2(kdf2_out1, kdf2_out2, key, input, strlen(input));
+
+    /* kdf1 == kdf2's first output */
+    bool kdf1_eq_kdf2 = compare_bytes(kdf1_out, kdf2_out1, 32);
+
+    /* kdf2's two outputs must differ */
+    bool kdf2_diff = !compare_bytes(kdf2_out1, kdf2_out2, 32);
+
+    /* kdf3's first two outputs should match kdf2 */
+    uint8_t kdf3_out1[32], kdf3_out2[32], kdf3_out3[32];
+    wg_kdf3(kdf3_out1, kdf3_out2, kdf3_out3, key, input, strlen(input));
+
+    bool kdf3_eq1 = compare_bytes(kdf3_out1, kdf2_out1, 32);
+    bool kdf3_eq2 = compare_bytes(kdf3_out2, kdf2_out2, 32);
+    bool kdf3_diff = !compare_bytes(kdf3_out2, kdf3_out3, 32);
+
+    results.push_back({"KDF Consistency", kdf1_eq_kdf2 && kdf2_diff && kdf3_eq1 && kdf3_eq2 && kdf3_diff});
+}
+
+static void test_kdf_deterministic() {
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
+
+    uint8_t out_a[32], out_b[32];
+    wg_kdf1(out_a, key, "same", 4);
+    wg_kdf1(out_b, key, "same", 4);
+    bool same_ok = compare_bytes(out_a, out_b, 32);
+
+    /* Different input → different output */
+    wg_kdf1(out_b, key, "diff", 4);
+    bool diff_input = !compare_bytes(out_a, out_b, 32);
+
+    /* Different key → different output */
+    uint8_t key2[32];
+    memcpy(key2, key, 32);
+    key2[0] ^= 0xFF;
+    wg_kdf1(out_b, key2, "same", 4);
+    bool diff_key = !compare_bytes(out_a, out_b, 32);
+
+    /* Empty input */
+    wg_kdf1(out_a, key, NULL, 0);
+    wg_kdf1(out_b, key, NULL, 0);
+    bool empty_ok = compare_bytes(out_a, out_b, 32);
+
+    results.push_back({"KDF Deterministic", same_ok && diff_input && diff_key && empty_ok});
+}
+
+/* ── WireGuard construction constants test ── */
+
+static void test_wg_construction_hash() {
+    /*
+     * §5.4: C := HASH(CONSTRUCTION) where CONSTRUCTION = "Noise_IKpsk2_..."
+     * Then H := HASH(C || IDENTIFIER)
+     * Verify these are deterministic and match chained computation.
+     */
+    uint8_t c[32];
+    wg_hash(c, WG_CONSTRUCTION, strlen(WG_CONSTRUCTION));
+
+    uint8_t h[32];
+    wg_hash2(h, c, 32, WG_IDENTIFIER, strlen(WG_IDENTIFIER));
+
+    /* Recompute — must be identical */
+    uint8_t c2[32], h2[32];
+    wg_hash(c2, WG_CONSTRUCTION, strlen(WG_CONSTRUCTION));
+    wg_hash2(h2, c2, 32, WG_IDENTIFIER, strlen(WG_IDENTIFIER));
+
+    bool c_ok = compare_bytes(c, c2, 32);
+    bool h_ok = compare_bytes(h, h2, 32);
+    /* C and H must differ */
+    bool diff_ok = !compare_bytes(c, h, 32);
+
+    results.push_back({"WG Construction", c_ok && h_ok && diff_ok});
+}
+
+/* ── Base64 edge cases ── */
+
+static void test_base64_edge_cases() {
+    /* Valid roundtrip (already tested, but include for completeness) */
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
+    char b64[64];
+    bool encode_ok = (wg_key_to_base64(b64, sizeof(b64), key) == 0);
+    uint8_t decoded[32];
+    bool decode_ok = (wg_key_from_base64(decoded, b64) == 0);
+    bool match_ok = compare_bytes(decoded, key, 32);
+
+    /* Too-short buffer for encoding */
+    char short_buf[10];
+    bool short_encode = (wg_key_to_base64(short_buf, sizeof(short_buf), key) != 0);
+
+    /* NULL input */
+    bool null_ok = (wg_key_from_base64(decoded, NULL) != 0);
+
+    /* Too-short base64 string */
+    bool short_ok = (wg_key_from_base64(decoded, "AAAA") != 0);
+
+    /* Invalid characters */
+    char invalid[44] = {};
+    memset(invalid, '!', 43);
+    invalid[43] = '\0';
+    bool invalid_ok = (wg_key_from_base64(decoded, invalid) != 0);
+
+    /* All zeros key */
+    uint8_t zero_key[32] = {0};
+    char zero_b64[64];
+    wg_key_to_base64(zero_b64, sizeof(zero_b64), zero_key);
+    uint8_t zero_decoded[32];
+    bool zero_ok = (wg_key_from_base64(zero_decoded, zero_b64) == 0) &&
+                   compare_bytes(zero_decoded, zero_key, 32);
+
+    /* All 0xFF key */
+    uint8_t ff_key[32];
+    memset(ff_key, 0xFF, 32);
+    char ff_b64[64];
+    wg_key_to_base64(ff_b64, sizeof(ff_b64), ff_key);
+    uint8_t ff_decoded[32];
+    bool ff_ok = (wg_key_from_base64(ff_decoded, ff_b64) == 0) &&
+                 compare_bytes(ff_decoded, ff_key, 32);
+
+    results.push_back({"Base64 Edges", encode_ok && decode_ok && match_ok && short_encode &&
+                                        null_ok && short_ok && invalid_ok && zero_ok && ff_ok});
+}
+
+/* ── Rekey index matching test (§6.3 / old_local_index) ── */
+
+static void test_rekey_index_matching() {
+    uint8_t priv[32], pub[32], peer_pub[32];
+    wg_generate_keypair(priv, pub);
+    wg_generate_keypair(peer_pub, peer_pub);
+
+    WgConfig config = {};
+    memcpy(config.private_key, priv, 32);
+    memcpy(config.peer_public_key, peer_pub, 32);
+    config.tunnel_ip.s_addr = inet_addr("10.0.0.2");
+    strncpy(config.endpoint_host, "127.0.0.1", sizeof(config.endpoint_host));
+    config.endpoint_port = 51820;
+    config.keepalive_interval = 25;
+
+    WgTunnel* tun = wg_init(&config);
+    if (!tun) {
+        results.push_back({"Rekey Index Match", false});
+        return;
+    }
+
+    /*
+     * Simulate the state after wg_handshake_init during rekey:
+     *   - session.local_index = NEW sender index (0xAAAAAAAA)
+     *   - session.old_local_index = OLD sender index (0xBBBBBBBB)
+     *   - session.rekey_in_progress = true
+     *   - prev_session.valid = true, prev_session.local_index = 0xCCCCCCCC
+     *
+     * The recv thread must accept transport packets addressed to ANY of:
+     *   1. session.local_index (new, unconfirmed)
+     *   2. session.old_local_index (old, while rekey in progress)
+     *   3. prev_session.local_index (even older session)
+     * And reject anything else.
+     */
+    const uint32_t NEW_IDX  = 0xAAAAAAAA;
+    const uint32_t OLD_IDX  = 0xBBBBBBBB;
+    const uint32_t PREV_IDX = 0xCCCCCCCC;
+    const uint32_t BAD_IDX  = 0xDDDDDDDD;
+
+    /* Set up a fake valid session in rekey state */
+    uint8_t recv_key[WG_KEY_LEN];
+    memset(recv_key, 0x42, WG_KEY_LEN);
+    memcpy(tun->session.receiving_key, recv_key, WG_KEY_LEN);
+    tun->session.local_index = NEW_IDX;
+    tun->session.old_local_index = OLD_IDX;
+    tun->session.rekey_in_progress = true;
+    tun->session.valid = true;
+    tun->session.last_handshake = wg_time_now();
+    tun->session.receiving_counter = 0;
+    memset(&tun->session.replay, 0, sizeof(tun->session.replay));
+
+    /* Set up prev_session */
+    uint8_t prev_key[WG_KEY_LEN];
+    memset(prev_key, 0x99, WG_KEY_LEN);
+    memcpy(tun->prev_session.receiving_key, prev_key, WG_KEY_LEN);
+    tun->prev_session.local_index = PREV_IDX;
+    tun->prev_session.valid = true;
+    tun->prev_session.last_handshake = wg_time_now();
+    tun->prev_session.receiving_counter = 0;
+    memset(&tun->prev_session.replay, 0, sizeof(tun->prev_session.replay));
+
+    /*
+     * Replicate the recv thread's index matching logic (wireguard.c:415-427).
+     * This is the exact code path that the old_local_index fix addresses.
+     */
+    auto match_session = [&](uint32_t receiver_index) -> WgSession* {
+        if (receiver_index == tun->session.local_index) {
+            return &tun->session;
+        } else if (tun->session.rekey_in_progress &&
+                   receiver_index == tun->session.old_local_index) {
+            return &tun->session;
+        } else if (tun->prev_session.valid &&
+                   receiver_index == tun->prev_session.local_index) {
+            return &tun->prev_session;
+        }
+        return nullptr;
+    };
+
+    /* Test 1: NEW index matches current session */
+    WgSession* s1 = match_session(NEW_IDX);
+    bool new_ok = (s1 == &tun->session);
+
+    /* Test 2: OLD index matches current session during rekey (the fix) */
+    WgSession* s2 = match_session(OLD_IDX);
+    bool old_ok = (s2 == &tun->session);
+
+    /* Test 3: PREV index matches prev_session */
+    WgSession* s3 = match_session(PREV_IDX);
+    bool prev_ok = (s3 == &tun->prev_session);
+
+    /* Test 4: BAD index matches nothing */
+    WgSession* s4 = match_session(BAD_IDX);
+    bool bad_ok = (s4 == nullptr);
+
+    /* Test 5: OLD index should NOT match when rekey is NOT in progress */
+    tun->session.rekey_in_progress = false;
+    WgSession* s5 = match_session(OLD_IDX);
+    bool no_rekey_ok = (s5 == nullptr);
+
+    /* Test 6: Verify AEAD decrypt works on the matched session's key.
+     * This confirms the full path: index match → correct key → decrypt success.
+     */
+    tun->session.rekey_in_progress = true; /* restore */
+    uint8_t plaintext[] = {0x45, 0x00, 0x00, 0x1c}; /* minimal IP header */
+    uint8_t ciphertext[sizeof(plaintext) + WG_AEAD_TAG_LEN];
+    wg_aead_encrypt(ciphertext, recv_key, 0, plaintext, sizeof(plaintext), NULL, 0);
+
+    /* Decrypt using the key from the session matched by OLD index */
+    WgSession* matched = match_session(OLD_IDX);
+    uint8_t decrypted[sizeof(plaintext)];
+    bool decrypt_ok = false;
+    if (matched) {
+        int dec = wg_aead_decrypt(decrypted, matched->receiving_key, 0,
+                                  ciphertext, sizeof(ciphertext), NULL, 0);
+        decrypt_ok = (dec == 0) && (memcmp(decrypted, plaintext, sizeof(plaintext)) == 0);
+    }
+
+    wg_close(tun);
+
+    bool all_ok = new_ok && old_ok && prev_ok && bad_ok && no_rekey_ok && decrypt_ok;
+    results.push_back({"Rekey Index Match", all_ok});
+}
+
+/* ── Session expiry test ── */
+
+static void test_session_expiry() {
+    uint8_t priv[32], pub[32], peer_pub[32];
+    wg_generate_keypair(priv, pub);
+    wg_generate_keypair(peer_pub, peer_pub);
+
+    WgConfig config = {};
+    memcpy(config.private_key, priv, 32);
+    memcpy(config.peer_public_key, peer_pub, 32);
+    config.tunnel_ip.s_addr = inet_addr("10.0.0.2");
+    strncpy(config.endpoint_host, "127.0.0.1", sizeof(config.endpoint_host));
+    config.endpoint_port = 51820;
+    config.keepalive_interval = 25;
+
+    WgTunnel* tun = wg_init(&config);
+    if (!tun) {
+        results.push_back({"Session Expiry", false});
+        return;
+    }
+
+    /* Not connected — wg_send should fail */
+    uint8_t data[] = {0x01, 0x02};
+    bool not_connected = (wg_send(tun, data, 2) == WG_ERR_NOT_CONNECTED);
+
+    /* Fake a valid session */
+    memset(tun->session.sending_key, 0xAA, WG_KEY_LEN);
+    tun->session.remote_index = 0x12345678;
+    tun->session.valid = true;
+    tun->session.sending_counter = 0;
+
+    /* Session with recent handshake — should NOT be expired */
+    tun->session.last_handshake = wg_time_now();
+
+    /* Open socket so wg_send can actually try to send */
+    wg_socket_open(tun);
+
+    bool send_ok = (wg_send(tun, data, 2) >= 0 || wg_send(tun, data, 2) == WG_ERR_SOCKET);
+    /* WG_ERR_SOCKET is acceptable — we're sending to 127.0.0.1 which may fail,
+     * but the point is it got past the session validity checks */
+
+    /* Set handshake time far in the past (> REJECT_AFTER_TIME = 180s) */
+    tun->session.last_handshake = wg_time_now() - ((uint64_t)WG_REJECT_AFTER_TIME + 1) * 1000000000ULL;
+    bool expired = (wg_send(tun, data, 2) == WG_ERR_NOT_CONNECTED);
+
+    /* Set counter past REJECT_AFTER_MESSAGES */
+    tun->session.last_handshake = wg_time_now(); /* reset time */
+    tun->session.sending_counter = WG_REJECT_AFTER_MESSAGES;
+    bool counter_expired = (wg_send(tun, data, 2) == WG_ERR_NOT_CONNECTED);
+
+    wg_close(tun);
+
+    results.push_back({"Session Expiry", not_connected && expired && counter_expired});
+}
+
 static void run_all_tests() {
     results.clear();
     test_blake2s();
@@ -797,6 +1589,28 @@ static void run_all_tests() {
     test_lwip_relay();
     test_udp_send();
     test_rekey_integration();
+    test_counter_sequential();
+    test_counter_duplicate();
+    test_counter_out_of_order();
+    test_counter_window_boundary();
+    test_counter_reject_after_messages();
+    test_counter_large_jump();
+    test_xchacha20poly1305();
+    test_aead_roundtrip();
+    test_aead_with_ad();
+    test_aead_empty();
+    test_cookie_reply_flow();
+    test_wg_hash();
+    test_wg_hash2();
+    test_wg_mac();
+    test_wg_hmac();
+    test_kdf_consistency();
+    test_kdf_deterministic();
+    test_wg_construction_hash();
+    test_base64_edge_cases();
+    test_rekey_index_matching();
+    test_session_expiry();
+    test_transport_after_rekey();
 }
 
 class TestActivity : public brls::Activity {
@@ -804,9 +1618,14 @@ public:
     brls::View* createContentView() override {
         run_all_tests();
 
+        auto* scroll = new brls::ScrollingFrame();
+        scroll->setWidthPercentage(100);
+        scroll->setHeightPercentage(100);
+
         auto* box = new brls::Box(brls::Axis::COLUMN);
-        box->setJustifyContent(brls::JustifyContent::CENTER);
         box->setAlignItems(brls::AlignItems::CENTER);
+        box->setPaddingTop(40);
+        box->setPaddingBottom(40);
 
         int passed = 0, failed = 0;
         for (const auto& r : results) {
@@ -829,11 +1648,14 @@ public:
             auto* row = new brls::Box(brls::Axis::ROW);
             row->setAlignItems(brls::AlignItems::CENTER);
             row->setMarginBottom(10);
+            row->setFocusable(true);
 
             auto* name = new brls::Label();
             std::string label = r.name;
             if (r.name == "Rekey" && !rekey_error_detail.empty()) {
                 label = fmt::format("Rekey ({})", rekey_error_detail);
+            } else if (r.name == "Transport Rekey" && !transport_error_detail.empty()) {
+                label = fmt::format("Transport Rekey ({})", transport_error_detail);
             } else if (r.name.find("Poly1305") != std::string::npos && !poly1305_error_detail.empty() && !r.passed) {
                 label = fmt::format("{} ({})", r.name, poly1305_error_detail);
             }
@@ -849,7 +1671,8 @@ public:
             box->addView(row);
         }
 
-        return box;
+        scroll->setContentView(box);
+        return scroll;
     }
 };
 

@@ -30,15 +30,17 @@ int wg_socket_open(WgTunnel* tun) {
 }
 
 int wg_socket_send(WgTunnel* tun, const void* data, size_t len) {
-    ssize_t sent = sendto(tun->socket_fd, data, len, 0,
-                          (struct sockaddr*)&tun->endpoint,
-                          sizeof(tun->endpoint));
-    if (sent < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return (int)len;
-        return WG_ERR_SOCKET;
+    for (int retry = 0; retry < 10; retry++) {
+        ssize_t sent = sendto(tun->socket_fd, data, len, 0,
+                              (struct sockaddr*)&tun->endpoint,
+                              sizeof(tun->endpoint));
+        if (sent >= 0)
+            return (int)sent;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return WG_ERR_SOCKET;
+        wg_sleep_ms(1);
     }
-    return (int)sent;
+    return WG_ERR_SOCKET;
 }
 
 int wg_socket_recv(WgTunnel* tun, void* buf, size_t len, int timeout_ms) {
@@ -56,11 +58,24 @@ int wg_socket_recv(WgTunnel* tun, void* buf, size_t len, int timeout_ms) {
     if (!(pfd.revents & POLLIN))
         return WG_ERR_SOCKET;
 
-    ssize_t received = recv(tun->socket_fd, buf, len, 0);
+    struct sockaddr_in src;
+    socklen_t src_len = sizeof(src);
+    ssize_t received = recvfrom(tun->socket_fd, buf, len, 0,
+                                (struct sockaddr*)&src, &src_len);
     if (received < 0)
         return WG_ERR_SOCKET;
 
+    tun->recv_src = src;
+    tun->recv_src_valid = true;
+
     return (int)received;
+}
+
+void wg_update_endpoint_from_recv(WgTunnel* tun) {
+    if (tun->recv_src_valid) {
+        tun->endpoint = tun->recv_src;
+        tun->recv_src_valid = false;
+    }
 }
 
 void wg_socket_close(WgTunnel* tun) {
@@ -71,7 +86,7 @@ void wg_socket_close(WgTunnel* tun) {
 }
 
 uint64_t wg_time_now(void) {
-    return armGetSystemTick() * 1000000000ULL / armGetSystemTickFreq();
+    return armTicksToNs(armGetSystemTick());
 }
 
 void wg_sleep_ms(int ms) {
