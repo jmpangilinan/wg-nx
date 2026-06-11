@@ -33,11 +33,18 @@ typedef struct {
 } WgConfig;
 
 typedef struct WgTunnel WgTunnel;
+typedef struct WgRecvSlot WgRecvSlot;
 
-typedef void (*WgRecvCallback)(void* user, const void* data, size_t len);
+/* Recv callback.
+ *   `data` points inside `slot` and is valid until the slot is released.
+ *   Return 0 to auto-release the slot on return (synchronous consumers).
+ *   Return non-zero to take ownership: caller MUST later call
+ *   wg_recv_slot_release(tun, slot) exactly once (zero-copy async consumers). */
+typedef int (*WgRecvCallback)(void* user, WgRecvSlot* slot, const void* data, size_t len);
 
 WgTunnel* wg_init(const WgConfig* config);
 void wg_set_recv_callback(WgTunnel* tun, WgRecvCallback cb, void* user);
+void wg_recv_slot_release(WgTunnel* tun, WgRecvSlot* slot);
 int wg_connect(WgTunnel* tun);
 int wg_start(WgTunnel* tun);
 void wg_stop(WgTunnel* tun);
@@ -53,6 +60,20 @@ void wg_generate_keypair(uint8_t private_key[WG_KEY_LEN], uint8_t public_key[WG_
 int wg_rekey(WgTunnel* tun);
 uint32_t wg_get_session_index(WgTunnel* tun);
 
+// ─── Multi-peer API ───
+#define WG_RELAY_HASH_LEN 36
+#define WG_MAX_PEERS 64
+
+typedef struct WgPeer WgPeer;
+
+WgPeer* wg_add_peer(WgTunnel* tun, const uint8_t public_key[WG_KEY_LEN],
+                    const uint8_t relay_hash[WG_RELAY_HASH_LEN], uint32_t ip_raw);
+WgPeer* wg_find_peer_by_ip(WgTunnel* tun, uint32_t ip_raw);
+int wg_send_to_peer(WgTunnel* tun, WgPeer* peer, const void* data, size_t len);
+
 void wg_set_log_callback(void (*func)(const char* msg));
+
+// Canary check — returns 0 on corruption, 1 on success
+int wg_canary_check(WgTunnel *tun);
 
 #endif

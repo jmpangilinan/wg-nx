@@ -5,21 +5,43 @@
 #include "wg_thread.h"
 #include "monocypher.h"
 #include <stdbool.h>
+#include <stdio.h>
 
 #define WG_CONSTRUCTION "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
 #define WG_IDENTIFIER "WireGuard v1 zx2c4 Jason@zx2c4.com"
 #define WG_LABEL_MAC1 "mac1----"
 #define WG_LABEL_COOKIE "cookie--"
 
+// Canary magic to detect buffer overflows
+#define WG_CANARY_MAGIC 0xDEADC0DE
+
 #define WG_HASH_LEN 32
 #define WG_AEAD_TAG_LEN 16
 #define WG_TIMESTAMP_LEN 12
 #define WG_COOKIE_LEN 16
 #define WG_MAC_LEN 16
+#define WG_RELAY_HASH_LEN 36
 
 #define WG_REKEY_AFTER_MESSAGES  ((uint64_t)1 << 60)
 #define WG_COUNTER_WINDOW_SIZE   8192
 #define WG_REJECT_AFTER_MESSAGES (UINT64_MAX - WG_COUNTER_WINDOW_SIZE - 1)
+
+#define WG_RECV_SLOT_CAP   2048
+#define WG_RECV_POOL_SIZE  256
+
+#define WG_MAX_PEERS 64
+
+struct WgRecvSlot {
+    struct WgRecvSlot* next;
+    uint8_t data[WG_RECV_SLOT_CAP];
+};
+
+typedef struct {
+    WgRecvSlot* slots;
+    WgRecvSlot* free_head;
+    WgMutex free_mutex;
+    bool initialized;
+} WgRecvPool;
 
 #define WG_COUNTER_WORDS (WG_COUNTER_WINDOW_SIZE / (sizeof(uint64_t) * 8))
 typedef struct {
@@ -101,9 +123,31 @@ typedef struct {
     WgReplayCounter replay;
 } WgSession;
 
+// ─── Multi-peer support ──────────────────────────────────────
+
+typedef struct WgPeer {
+    uint8_t public_key[WG_KEY_LEN];       // peer's static public key
+    uint8_t relay_hash[WG_RELAY_HASH_LEN]; // relay peer hash (sha-XXXX...)
+    struct in_addr tunnel_ip;              // peer's NetBird IP
+    uint32_t ip_raw;                      // IP in network byte order
+    
+    WgSession session;
+    WgSession prev_session;
+    WgHandshakeState pending_hs;  // stored during active handshake init
+    bool hs_pending;               // true if handshake is in progress
+    
+    bool configured;     // slot is in use
+    bool connected;      // session established
+    
+    uint64_t last_sent;
+    uint8_t last_mac1[WG_MAC_LEN];
+} WgPeer;
+
 struct WgTunnel {
     uint8_t static_private[WG_KEY_LEN];
     uint8_t static_public[WG_KEY_LEN];
+    
+    // Legacy single-peer fields (kept for backward compat with wg_connect/wg_rekey)
     uint8_t peer_public[WG_KEY_LEN];
     uint8_t preshared_key[WG_KEY_LEN];
     bool has_psk;
@@ -111,8 +155,17 @@ struct WgTunnel {
     struct sockaddr_in endpoint;
     uint16_t keepalive_interval;
     int socket_fd;
-    WgSession session;
-    WgSession prev_session;
+    WgSession session;          // legacy (keep for wg_connect path)
+    WgSession prev_session;     // legacy
+    
+    // ─── Multi-peer ───
+    WgPeer peers[WG_MAX_PEERS];
+    int peer_count;
+    
+    // Canary to detect buffer overflows
+    uint32_t canary_begin;
+    
+    // Cookie (shared across all peers)
     uint8_t cookie[WG_COOKIE_LEN];
     bool has_cookie;
     uint64_t cookie_timestamp;
@@ -135,7 +188,27 @@ struct WgTunnel {
 
     struct sockaddr_in recv_src;
     bool recv_src_valid;
+
+    WgRecvPool recv_pool;
+    
+    uint32_t canary_end;  // must be last field — detect overflow
 };
+
+// ─── Peer management ───
+WgPeer* wg_add_peer(WgTunnel* tun, const uint8_t public_key[WG_KEY_LEN],
+                    const uint8_t relay_hash[WG_RELAY_HASH_LEN], uint32_t ip_raw);
+WgPeer* wg_find_peer_by_ip(WgTunnel* tun, uint32_t ip_raw);
+WgPeer* wg_find_peer_by_local_index(WgTunnel* tun, uint32_t local_index);
+WgPeer* wg_find_peer_by_public_key(WgTunnel* tun, const uint8_t public_key[WG_KEY_LEN]);
+
+// ─── Send to a specific peer ───
+int wg_send_to_peer(WgTunnel* tun, WgPeer* peer, const void* data, size_t len);
+void wg_send_keepalive_to_peer(WgTunnel* tun, WgPeer* peer);
+
+int wg_recv_pool_init(WgRecvPool* pool);
+void wg_recv_pool_destroy(WgRecvPool* pool);
+WgRecvSlot* wg_recv_pool_acquire(WgRecvPool* pool);
+void wg_recv_pool_release(WgRecvPool* pool, WgRecvSlot* slot);
 
 void wg_hash(uint8_t out[WG_HASH_LEN], const void* data, size_t len);
 void wg_hash2(uint8_t out[WG_HASH_LEN], const void* a, size_t a_len, const void* b, size_t b_len);
@@ -157,18 +230,29 @@ void wg_sleep_ms(int ms);
 bool wg_counter_validate(WgReplayCounter* rc, uint64_t counter);
 
 int wg_handshake_init(WgTunnel* tun, WgHandshakeInit* msg, WgHandshakeState* state);
+int wg_handshake_init_peer(WgTunnel* tun, WgPeer* peer, WgHandshakeInit* msg, WgHandshakeState* state);
+int wg_handshake_init_process_response(WgTunnel* tun, WgPeer* peer, const WgHandshakeResponse* msg);
+int wg_handshake_init_process(WgTunnel* tun, const WgHandshakeInit* msg);
 int wg_handshake_response(WgTunnel* tun, const WgHandshakeResponse* msg, WgHandshakeState* state);
 int wg_process_cookie_reply(WgTunnel* tun, const WgCookieReply* msg);
 
 int wg_socket_open(WgTunnel* tun);
 int wg_socket_send(WgTunnel* tun, const void* data, size_t len);
+int wg_socket_send_to(WgTunnel* tun, const uint8_t* relay_hash, const void* data, size_t len);
 int wg_socket_recv(WgTunnel* tun, void* buf, size_t len, int timeout_ms);
+
+// Relay integration: replace socket layer with relay transport
+void wg_set_relay_send(void (*send_fn)(const uint8_t* peer_hash, const void* data, size_t len));
+void wg_relay_input(const void *data, size_t len);
+void wg_relay_commit(void);
 void wg_socket_close(WgTunnel* tun);
 void wg_update_endpoint_from_recv(WgTunnel* tun);
 
 uint32_t wg_random_index(void);
 int wg_resolve_endpoint(WgTunnel* tun, const char* host, uint16_t port);
 
-void wg_log(const char* fmt, ...);
+extern bool wg_log_enabled;
+void wg_log_impl(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+#define wg_log(...) do { if (__builtin_expect(wg_log_enabled, 0)) wg_log_impl(__VA_ARGS__); } while (0)
 
 #endif

@@ -8,19 +8,28 @@
 
 #define MEM_ALIGNMENT                   4
 #define MEM_SIZE                        (32 * 1024)
-#define MEMP_NUM_PBUF                   32
+#define MEMP_NUM_PBUF                   128
 #define MEMP_NUM_UDP_PCB                8
 #define MEMP_NUM_TCP_PCB                8
 #define MEMP_NUM_TCP_PCB_LISTEN         4
-#define MEMP_NUM_TCP_SEG                32
-#define PBUF_POOL_SIZE                  32
+#define MEMP_NUM_TCP_SEG                64
+#define PBUF_POOL_SIZE                  128
 #define PBUF_POOL_BUFSIZE               1600
 
+#define LWIP_SUPPORT_CUSTOM_PBUF        1
+
 #define LWIP_TCP                        1
-#define TCP_MSS                         1460
-#define TCP_SND_BUF                     (8 * TCP_MSS)
-#define TCP_SND_QUEUELEN                (4 * TCP_SND_BUF / TCP_MSS)
-#define TCP_WND                         (8 * TCP_MSS)
+#define LWIP_TCP_KEEPALIVE              1
+#define LWIP_TCP_RTO_TIME               1000
+#define TCP_KEEPIDLE_DEFAULT            30000  /* was 5000 — kernel is 7200000 */
+#define TCP_KEEPINTVL_DEFAULT           10000  /* was 3000 — kernel is 75000 */
+#define TCP_KEEPCNT_DEFAULT             9      /* was 20 — kernel is 9 */
+#define TCP_MSS                         1400
+#define TCP_SND_BUF                     (32 * 1024)
+#define TCP_SND_QUEUELEN                64
+#define TCP_WND                         (32 * 1024)
+#define LWIP_TCP_TIMESTAMPS             1
+#define LWIP_TCP_SACK_OUT               1
 
 #define LWIP_UDP                        1
 

@@ -22,15 +22,17 @@ struct WgRelay {
     int running;
 };
 
-static void relay_recv_callback(void* user, const void* data, size_t len) {
+static int relay_recv_callback(void* user, WgRecvSlot* slot, const void* data, size_t len) {
+    (void)slot;
     WgRelay* relay = (WgRelay*)user;
 
     if (!relay->has_client)
-        return;
+        return 0;
 
     sendto(relay->local_socket, data, len, 0,
            (struct sockaddr*)&relay->client_addr,
            sizeof(relay->client_addr));
+    return 0;
 }
 
 static void* relay_thread_func(void* arg) {

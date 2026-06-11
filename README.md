@@ -76,11 +76,16 @@ void wg_close(WgTunnel* tun);
 ### Send/Receive
 
 ```c
-typedef void (*WgRecvCallback)(void* user, const void* data, size_t len);
+/* Zero-copy recv callback. `data` lives inside `slot`.
+ *   Return 0  -> slot is auto-released on return (simple synchronous consumers).
+ *   Return !0 -> callback takes ownership; must later call
+ *                wg_recv_slot_release(tun, slot) exactly once. */
+typedef int (*WgRecvCallback)(void* user, WgRecvSlot* slot, const void* data, size_t len);
 
 int wg_send(WgTunnel* tun, const void* data, size_t len);
 int wg_recv(WgTunnel* tun, void* buf, size_t len, int timeout_ms);
 void wg_set_recv_callback(WgTunnel* tun, WgRecvCallback cb, void* user);
+void wg_recv_slot_release(WgTunnel* tun, WgRecvSlot* slot);
 ```
 
 ### Session Management
@@ -149,7 +154,6 @@ public:
     uint16_t startTcpRelay(uint16_t targetPort, uint16_t localPort);
     uint16_t startUdpRelay(uint16_t targetPort, uint16_t localPort);
 
-    void handleIncomingPacket(const void* data, size_t len);
     void tick();
 
     bool isRunning() const;
@@ -157,6 +161,10 @@ public:
 
 }
 ```
+
+`LwipRelay::start()` installs its own zero-copy recv callback on the tunnel; no
+manual `wg_set_recv_callback` wiring is required. The relay must be stopped (or
+destroyed, which stops it) before `wg_close(tun)`.
 
 #### Example
 
@@ -174,10 +182,6 @@ relay.start("10.0.0.2", "10.0.0.1");
 
 relay.startTcpRelay(9295, 9295);
 relay.startUdpRelay(9296, 9296);
-
-wg_set_recv_callback(tunnel, [](void* ctx, const void* data, size_t len) {
-    static_cast<wgnx::LwipRelay*>(ctx)->handleIncomingPacket(data, len);
-}, &relay);
 
 relay.stop();
 ```

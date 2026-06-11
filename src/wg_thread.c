@@ -36,6 +36,14 @@ int wg_thread_set_name(WgThread *thread, const char *name) {
 }
 
 void wg_thread_set_affinity(WgThreadName name) {
+    // Pin threads to specific cores: WG recv → Core 2
+    switch (name) {
+        case WG_THREAD_NAME_RECV:
+            svcSetThreadCoreMask(-3, 3, 0x4);  // Core 2
+            break;
+        default:
+            break;
+    }
     if (g_wg_affinity_cb)
         g_wg_affinity_cb(name, g_wg_affinity_cb_user);
 }
