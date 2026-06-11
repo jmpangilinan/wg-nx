@@ -1,6 +1,6 @@
 [submodule "library/borealis"]
 	path = library/borealis
-	url = git@github.com:xlanor/borealis.git
+	url = https://github.com/xlanor/borealis.git
 [submodule "library/libsodium"]
 	path = library/libsodium
 	url = https://github.com/jedisct1/libsodium.git
